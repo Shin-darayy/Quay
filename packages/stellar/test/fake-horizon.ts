@@ -1,9 +1,11 @@
+import type { Asset, Horizon } from "@stellar/stellar-sdk";
 import type {
   HorizonAccount,
   HorizonAccountBalance,
   HorizonClient,
   HorizonPaymentRecord,
   PaymentsCallBuilder,
+  StrictReceivePathsCallBuilder,
 } from "../src/horizon-client";
 
 interface Listener {
@@ -35,6 +37,14 @@ export class FakeHorizonClient implements HorizonClient {
   private readonly listeners = new Map<string, Set<Listener>>();
   private notFoundAccounts = new Set<string>();
   private readonly balances = new Map<string, HorizonAccountBalance[]>();
+  private strictReceivePathsRecords: Horizon.ServerApi.PaymentPathRecord[] = [];
+  private strictReceivePathsFailures: unknown[] = [];
+  private strictReceivePathsCalls = 0;
+  private lastStrictReceivePathsArgs: {
+    source: string | Asset[];
+    destinationAsset: Asset;
+    destinationAmount: string;
+  } | null = null;
 
   payments(): PaymentsCallBuilder {
     return new FakeBuilder(this);
@@ -49,6 +59,44 @@ export class FakeHorizonClient implements HorizonClient {
       throw err;
     }
     return { balances: this.balances.get(account) ?? [] };
+  }
+
+  /** Canned `GET /paths/strict-receive` records returned by the stub. */
+  setStrictReceivePaths(records: Horizon.ServerApi.PaymentPathRecord[]): void {
+    this.strictReceivePathsRecords = [...records];
+  }
+
+  /** Makes the next `times` strict-receive calls throw `err` (retry testing). */
+  failStrictReceivePaths(err: unknown, times = 1): void {
+    for (let i = 0; i < times; i += 1) this.strictReceivePathsFailures.push(err);
+  }
+
+  strictReceivePathsCallCount(): number {
+    return this.strictReceivePathsCalls;
+  }
+
+  lastStrictReceivePathsCall(): {
+    source: string | Asset[];
+    destinationAsset: Asset;
+    destinationAmount: string;
+  } | null {
+    return this.lastStrictReceivePathsArgs;
+  }
+
+  strictReceivePaths(
+    source: string | Asset[],
+    destinationAsset: Asset,
+    destinationAmount: string,
+  ): StrictReceivePathsCallBuilder {
+    this.lastStrictReceivePathsArgs = { source, destinationAsset, destinationAmount };
+    return {
+      call: async () => {
+        this.strictReceivePathsCalls += 1;
+        const failure = this.strictReceivePathsFailures.shift();
+        if (failure !== undefined) throw failure;
+        return { records: [...this.strictReceivePathsRecords] };
+      },
+    };
   }
 
   /** Registers a trustline (with balance/limit) for `loadAccount`-based preflight checks. */
