@@ -112,7 +112,7 @@ Rate limit buckets are keyed by client IP (respecting `trustProxyHops`), or by t
 - **Standard limiter**: `RATE_LIMIT_MAX` requests per window (default 120 req / 60s).
 - **Strict limiter**: `RATE_LIMIT_STRICT_MAX` requests per window (default 20 req / 60s,
   window `RATE_LIMIT_STRICT_WINDOW_MS`), applied to sensitive routes: `POST /links`,
-  `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
+  `GET /links/:id/pay-options`, `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
   `POST /auth`, and `/api-keys/*`. The same budget is also kept as separate buckets per seller for
   `POST /seller/anchor-auth/challenge`, `POST /seller/anchor-auth` and `PUT /seller/kyc`, and per client
   IP for `POST /anchor-callbacks/*`.
@@ -590,6 +590,64 @@ Fires the `link.cancelled` webhook.
 | `403` | `missing_scope` | API key lacks `links:write` | Use a key with the scope |
 | `404` | `not_found` | Unknown link, or another seller's link | Check the id |
 | `409` | `Link cannot be cancelled (is "<status>")` | The state machine does not allow `cancelled` from the link's current status (for example `paid` or `offramp_pending`) | Refund out of band instead |
+
+---
+
+## `GET /links/:id/pay-options?account=G...`
+
+**Public — no auth.** Strict-rate-limited. Which assets the buyer's account can
+pay this link with besides the link's own asset, and how much of each it takes
+right now. The API asks Horizon for strict-receive paths from that account to
+the link's asset, for the link's **outstanding** amount: an underpaid link is
+quoted only what it still owes.
+
+Unavailable while `PATH_PAYMENTS_ENABLED` is off, which is the default.
+
+Only assets in `PATH_PAYMENTS_SOURCE_ASSETS` are offered (default `native`, so
+XLM alone). The link's own asset is never an option: paying with it is a plain
+payment.
+
+**200**
+```json
+{
+  "linkAsset": { "code": "USDC", "issuer": "GA5Z..." },
+  "amount": "10",
+  "options": [
+    {
+      "sourceAsset": { "code": "XLM", "issuer": null },
+      "sourceAmount": "24.1234567",
+      "sendMax": "24.3646913",
+      "path": [],
+      "quotedAt": 1763560000000,
+      "expiresAt": 1763560030000
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `amount` | The outstanding amount, in `linkAsset`. Every option delivers exactly this. |
+| `sourceAmount` | What the path costs now, in `sourceAsset`. |
+| `sendMax` | The most the buyer agrees to spend: `sourceAmount` plus `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`, rounded up to the next stroop. |
+| `path` | The assets traded through between source and destination, in order. Empty for a direct trade. |
+| `quotedAt`, `expiresAt` | Epoch milliseconds. `expiresAt` is `quotedAt` plus `PATH_QUOTE_TTL_MS` (default 30000). Ask again once it has passed. |
+
+`options` is empty when the account holds nothing it may pay with, when there
+is no path, and when the account does not exist on the ledger.
+
+The response carries `Cache-Control: no-store`.
+
+**Errors**
+
+| Status | `error` | When | What to do |
+|---|---|---|---|
+| `400` | `invalid_account` | `account` is missing or is not a G-address | Send the buyer's public key |
+| `404` | `not_found` | Unknown link | Check the id |
+| `409` | `link_not_payable` | The link is not `active` or `underpaid`. `status` holds what it is | Nothing to pay |
+| `501` | `path_payments_disabled` | The feature is switched off on this deployment | Offer the link's own asset only |
+| `502` | `quote_failed` | Horizon refused the path search. `retryable` is `false` | Do not retry as is |
+| `503` | `horizon_unavailable` | Horizon did not answer, or answered 429 or 5xx, after retries. `retryable` is `true` | Retry shortly |
 
 ---
 
