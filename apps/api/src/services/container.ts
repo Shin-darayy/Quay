@@ -5,6 +5,7 @@ import {
   StellarRail,
   HorizonWatcher,
   StreamingHorizonWatcher,
+  realHorizonClient,
   type HorizonStatus,
 } from "@checkout/stellar";
 import {
@@ -360,6 +361,17 @@ export async function createContainer(): Promise<Container> {
       ? (customer, anchorLabel) => anchorRegistry.hasLiveSession(customer, anchorLabel)
       : undefined,
     piiAudit: piiAuditService,
+    // Paying a link with another asset (issues 8.30, 4.64). The switch and the
+    // slippage are issue 8.30's settings. Until that lands there is no switch
+    // to read, so the feature is wired off here, which is also its default,
+    // and the slippage is that issue's default.
+    pathPayments: {
+      enabled: false,
+      maxSlippageBps: 100,
+      sourceAssets: [...env.pathPaymentsSourceAssets],
+      quoteTtlMs: env.pathQuoteTtlMs,
+      horizon: realHorizonClient(stellar.horizonUrl),
+    },
   });
 
   // A link stuck in `offramp_pending` whose job has no row in offramp_jobs was

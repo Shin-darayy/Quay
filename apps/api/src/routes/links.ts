@@ -238,6 +238,29 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
   // guard mounted here, any key carrying only the default
   // links:read/links:write/webhooks:manage set could cash a paid link out — the
   // scope was documented and enforced nowhere.
+  // Which assets this buyer can pay the link with, and how much of each (issue
+  // 4.64). Public, like the submit route below: the caller is a buyer holding
+  // a link. Strict-rate-limited, because every call is a path search on
+  // Horizon. The answer is a price that stands for seconds, so nothing may
+  // cache it, a refusal included.
+  app.get("/:id/pay-options", strictRateLimit, async (ctx) => {
+    ctx.header("Cache-Control", "no-store");
+    try {
+      const result = await c.service.getPayOptions(ctx.req.param("id"), ctx.req.query("account") ?? "", {
+        logger: getLogger(ctx),
+      });
+      return ctx.json(result, 200);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return ctx.json(
+          { error: err.message, ...(err.extra ?? {}) },
+          err.status as 400 | 404 | 409 | 501 | 502 | 503,
+        );
+      }
+      throw err;
+    }
+  });
+
   // Relay a transaction the buyer signed in their own wallet (issue #31).
   // Public and strict-rate-limited: the payer is a buyer holding a link, not an
   // authenticated seller, so there is no account to gate on. The XDR itself is

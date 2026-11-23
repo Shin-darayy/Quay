@@ -49,13 +49,22 @@ import {
   isAnchorRejection,
   truncateAnchorBody,
 } from "@checkout/offramp";
-import { resolveAsset, type StellarConfig } from "@checkout/stellar";
-import { Horizon, Operation, Transaction, type Memo } from "@stellar/stellar-sdk";
+import {
+  isNotFound,
+  isRetryable,
+  quoteStrictReceive,
+  resolveAsset,
+  sendMaxFor,
+  type PathQuote,
+  type StellarConfig,
+} from "@checkout/stellar";
+import { Horizon, Operation, StrKey, Transaction, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
 import { WebhookSender } from "./webhook-sender";
 import { AnchorHealthRegistry, type AnchorHealth, type AnchorHealthSnapshot } from "./anchor-health";
 import { metrics, recordAnchorAuthRequired, type AnchorAuthRoute } from "../metrics";
 import type { PiiAuditRecorder } from "./pii-audit";
+import type { PathPaymentsConfig, PayOptions } from "../path-payments";
 
 // Re-exported for callers that historically imported them from LinkService
 // (issue 3.23 moved the implementation into ./anchor-health).
@@ -204,6 +213,11 @@ export class LinkService {
       logger?: Logger;
       /** Audit log for system reads of seller identity (the cash-out KYC gate). Omitted = not audited. */
       piiAudit?: PiiAuditRecorder;
+      /**
+       * Paying a link with another asset (issues 8.30, 4.64). Omitted, or with
+       * `enabled` false, the feature is off and `getPayOptions` answers 501.
+       */
+      pathPayments?: PathPaymentsConfig;
     },
   ) {
     this.deps.logger = this.deps.logger ?? NOOP_LOGGER;
@@ -634,8 +648,7 @@ export class LinkService {
     // accounting. For an underpaid link, only the outstanding amount remains
     // due; requiring the original invoice amount here would make the wallet
     // path unable to complete split payments.
-    const outstandingStroops = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
-    const outstanding = fromStroops(outstandingStroops > 0n ? outstandingStroops : 0n);
+    const outstanding = outstandingAmount(link);
     if (compareAmount(payment.amount, outstanding) === "under") {
       throw new HttpError(
         409,
@@ -676,6 +689,81 @@ export class LinkService {
       log.warn({ event: "payment.submit.failed", linkId: link.id, error: detail, reason }, "wallet submit rejected");
       throw new HttpError(409, "payment_rejected", { reason, detail });
     }
+  }
+
+  /**
+   * What a buyer's account can pay this link with besides the link's own
+   * asset, and how much of each it takes right now (issue 4.64).
+   *
+   * The path search runs here and not in the browser, so that the slippage,
+   * the allowlist of source assets and the lifetime of a quote are the
+   * server's. What `submitPayment` later holds a path payment to has to come
+   * from the same place that quoted it.
+   *
+   * Only the outstanding amount is quoted, the amount `submitPayment`
+   * requires, so an underpaid link is not offered a path that pays it twice.
+   */
+  async getPayOptions(linkId: string, account: string, opts: ServiceCallOptions = {}): Promise<PayOptions> {
+    const log = opts.logger ?? this.deps.logger!;
+    const config = this.deps.pathPayments;
+    // The switch comes first: while it is off this endpoint does not exist,
+    // whatever was asked of it.
+    if (!config?.enabled) throw new HttpError(501, "path_payments_disabled");
+    if (!StrKey.isValidEd25519PublicKey(account)) throw new HttpError(400, "invalid_account");
+
+    const link = await this.deps.links.findById(linkId);
+    if (!link) throw new HttpError(404, "not_found");
+    if (link.status !== "active" && link.status !== "underpaid") {
+      throw new HttpError(409, "link_not_payable", { status: link.status });
+    }
+
+    const amount = outstandingAmount(link);
+    // Stamped before Horizon is asked, so a quote never claims to be younger
+    // than it is.
+    const quotedAt = (config.now ?? Date.now)();
+    let quotes: PathQuote[] = [];
+    // Nothing owed is nothing to quote, and Horizon refuses a zero amount.
+    if (toStroops(amount) > 0n) {
+      try {
+        quotes = await quoteStrictReceive({
+          client: config.horizon,
+          source: account,
+          destAsset: link.asset,
+          destAmount: amount,
+        });
+      } catch (err) {
+        // Horizon answers 404 for an account that is not on the ledger. Such a
+        // buyer holds nothing to pay with, which is an answer and not an outage.
+        if (!isNotFound(err)) {
+          const retryable = isRetryable(err);
+          log.warn(
+            {
+              event: "pay_options.quote_failed",
+              linkId: link.id,
+              retryable,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "path quote failed",
+          );
+          // No response, a 429 or a 5xx: Horizon is unavailable and asking
+          // again may work. Any other refusal would be refused again.
+          if (retryable) throw new HttpError(503, "horizon_unavailable", { retryable: true });
+          throw new HttpError(502, "quote_failed", { retryable: false });
+        }
+      }
+    }
+
+    const options = quotes
+      .filter((quote) => config.sourceAssets.some((allowed) => assetEquals(allowed, quote.sourceAsset)))
+      .map((quote) => ({
+        sourceAsset: quote.sourceAsset,
+        sourceAmount: quote.sourceAmount,
+        sendMax: sendMaxFor(quote.sourceAmount, config.maxSlippageBps),
+        path: quote.path,
+        quotedAt,
+        expiresAt: quotedAt + config.quoteTtlMs,
+      }));
+    return { linkAsset: link.asset, amount, options };
   }
 
   async cancelLink(id: string): Promise<PaymentLink> {
@@ -1720,6 +1808,16 @@ function offRampRejected(err: OffRampRejectedError): HttpError {
     limits: err.limits,
     availableTypes: err.availableTypes,
   });
+}
+
+/**
+ * What a link still owes: its amount less what has been paid toward it, never
+ * below zero. An underpaid link owes only this, which is why the submit check
+ * and the path quote both start from it and not from `link.amount`.
+ */
+function outstandingAmount(link: Pick<PaymentLink, "amount" | "paidAmount">): string {
+  const owed = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
+  return fromStroops(owed > 0n ? owed : 0n);
 }
 
 export class HttpError extends Error {
