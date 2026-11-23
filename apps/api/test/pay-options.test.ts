@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { Keypair, Networks, StrKey, type Asset, type Horizon } from "@stellar/stellar-sdk";
+import { Keypair, Networks, StrKey } from "@stellar/stellar-sdk";
 import { LINK_STATUSES, XLM, type AssetRef, type RailPort, type Seller, type SellerRepository } from "@checkout/core";
-import { sendMaxFor, type HorizonClient, type StellarConfig } from "@checkout/stellar";
+import { sendMaxFor, type StellarConfig } from "@checkout/stellar";
 import type { Container } from "../src/services/container";
 import { HttpError, LinkService } from "../src/services/link-service";
 import { linkRoutes } from "../src/routes/links";
@@ -16,12 +16,13 @@ import {
   ScriptedOffRamp,
   makeLink,
 } from "./fakes";
+import { StubHorizon, horizonError, pathRecordsTo } from "./path-payment-fakes";
 
 // ---------------------------------------------------------------------------
 //  GET /links/:id/pay-options — which assets a buyer can pay a link with, and
 //  how much of each (issue 4.64).
 //
-//  Nothing here reaches the network: Horizon is the stub below, and the quoting
+//  Nothing here reaches the network: Horizon is a stub, and the quoting
 //  itself is the real `quoteStrictReceive` / `sendMaxFor` from @checkout/stellar.
 // ---------------------------------------------------------------------------
 
@@ -34,58 +35,7 @@ const USDC: AssetRef = { code: "USDC", issuer: USDC_ISSUER };
 const EURC: AssetRef = { code: "EURC", issuer: EURC_ISSUER };
 const NOW = 1_763_560_000_000;
 
-type PathRecord = Horizon.ServerApi.PaymentPathRecord;
-
-/** A Horizon strict-receive record that pays `amount` USDC from `source`. */
-function pathRecord(source: AssetRef, sourceAmount: string, path: AssetRef[] = [], amount = "10"): PathRecord {
-  const asset = (prefix: string, ref: AssetRef) =>
-    ref.issuer === null
-      ? { [`${prefix}asset_type`]: "native" }
-      : {
-          [`${prefix}asset_type`]: ref.code.length <= 4 ? "credit_alphanum4" : "credit_alphanum12",
-          [`${prefix}asset_code`]: ref.code,
-          [`${prefix}asset_issuer`]: ref.issuer,
-        };
-  return {
-    ...asset("source_", source),
-    source_amount: sourceAmount,
-    ...asset("destination_", USDC),
-    destination_amount: amount,
-    path: path.map((hop) => asset("", hop)),
-  } as unknown as PathRecord;
-}
-
-/** What Horizon's SDK throws for an HTTP error: an error carrying the response. */
-function horizonError(status: number): Error {
-  return Object.assign(new Error(`Request failed with status code ${status}`), { response: { status } });
-}
-
-/** Horizon, as far as a path quote goes: canned records, scripted failures, and a record of what was asked. */
-class StubHorizon implements HorizonClient {
-  records: PathRecord[] = [];
-  failures: unknown[] = [];
-  calls: { source: string | Asset[]; destination: Asset; amount: string }[] = [];
-  /** Runs when Horizon is asked, for tests that care what happened before. */
-  onCall: () => void = () => {};
-
-  strictReceivePaths(source: string | Asset[], destination: Asset, amount: string) {
-    return {
-      call: async () => {
-        this.calls.push({ source, destination, amount });
-        this.onCall();
-        const failure = this.failures.shift();
-        if (failure !== undefined) throw failure;
-        return { records: [...this.records] };
-      },
-    };
-  }
-  payments(): never {
-    throw new Error("pay-options must not read payments");
-  }
-  loadAccount(): never {
-    throw new Error("pay-options must not load an account");
-  }
-}
+const pathRecord = pathRecordsTo(USDC);
 
 const stellar: StellarConfig = {
   network: "testnet",
