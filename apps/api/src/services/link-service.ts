@@ -58,7 +58,7 @@ import {
   type PathQuote,
   type StellarConfig,
 } from "@checkout/stellar";
-import { Horizon, Operation, StrKey, Transaction, type Memo } from "@stellar/stellar-sdk";
+import { Horizon, Operation, StrKey, Transaction, type Asset, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
 import { WebhookSender } from "./webhook-sender";
 import { AnchorHealthRegistry, type AnchorHealth, type AnchorHealthSnapshot } from "./anchor-health";
@@ -608,14 +608,32 @@ export class LinkService {
       );
     }
     const op = tx.operations[0]!;
-    if (op.type !== "payment") {
+    // A strict-receive path payment is a second accepted shape while paying
+    // with another asset is switched on (issues 8.30, 4.65). With the switch
+    // off nothing here changes: it is refused like any other operation.
+    const paths = this.deps.pathPayments?.enabled ? this.deps.pathPayments : undefined;
+    const pathPayment =
+      paths && op.type === "pathPaymentStrictReceive" ? (op as Operation.PathPaymentStrictReceive) : null;
+    if (op.type !== "payment" && !pathPayment) {
+      if (paths && op.type === "pathPaymentStrictSend") {
+        // Strict-send fixes what the buyer spends and lets what arrives float.
+        throw new HttpError(
+          400,
+          'Transaction must be a payment or a strict-receive path payment, got "pathPaymentStrictSend": ' +
+            "a strict-send path payment can deliver less than the link asks for",
+        );
+      }
       throw new HttpError(400, `Transaction must be a single payment operation, got "${op.type}"`);
     }
-    const payment = op as Operation.Payment;
+    // What the operation delivers, whichever of the two it is. Every check
+    // from here to the memo is on the destination side, and holds for both.
+    const payment = pathPayment
+      ? { destination: pathPayment.destination, asset: pathPayment.destAsset, amount: pathPayment.destAmount }
+      : (op as Operation.Payment);
 
     // A per-operation source lets the envelope move value out of an account
     // other than the signer's. Nothing about this flow needs it.
-    if (payment.source && payment.source !== tx.source) {
+    if (op.source && op.source !== tx.source) {
       throw new HttpError(400, "Payment operation must not override the transaction source account");
     }
 
@@ -631,12 +649,7 @@ export class LinkService {
       throw new HttpError(409, "Transaction destination does not match the link destination");
     }
 
-    // `getIssuer()` is typed as possibly-undefined even on a non-native asset;
-    // normalise to null so `assetEquals` compares like with like rather than
-    // silently treating an issued asset as native.
-    const txAsset: AssetRef = payment.asset.isNative()
-      ? { code: "XLM", issuer: null }
-      : { code: payment.asset.getCode(), issuer: payment.asset.getIssuer() ?? null };
+    const txAsset = assetRefOf(payment.asset);
     if (!assetEquals(txAsset, link.asset)) {
       throw new HttpError(
         409,
@@ -665,6 +678,8 @@ export class LinkService {
       }
     }
 
+    if (pathPayment) await this.assertPathPaymentIsBounded(tx, pathPayment, link, paths!, log);
+
     const server = new Horizon.Server(this.deps.stellar.horizonUrl);
     try {
       const res = await server.submitTransaction(tx);
@@ -688,6 +703,99 @@ export class LinkService {
       metrics.walletSubmissionsTotal.inc({ outcome: "rejected" });
       log.warn({ event: "payment.submit.failed", linkId: link.id, error: detail, reason }, "wallet submit rejected");
       throw new HttpError(409, "payment_rejected", { reason, detail });
+    }
+  }
+
+  /**
+   * What a path payment has to pass beyond a plain payment's checks (issue
+   * 4.65). It has a source side a plain payment does not: an asset, a path,
+   * and the most the buyer agrees to spend. A broken or tampered checkout can
+   * set those against the buyer, and a signed transaction with no near expiry
+   * can land minutes later at a much worse price.
+   *
+   * The cheap checks come first. The quote is last, so Horizon is asked only
+   * about a transaction that is otherwise acceptable.
+   */
+  private async assertPathPaymentIsBounded(
+    tx: Transaction,
+    op: Operation.PathPaymentStrictReceive,
+    link: PaymentLink,
+    config: PathPaymentsConfig,
+    log: Logger,
+  ): Promise<void> {
+    const sendAsset = assetRefOf(op.sendAsset);
+    if (assetEquals(sendAsset, link.asset)) {
+      throw new HttpError(
+        400,
+        `Path payment must send another asset than ${link.asset.code}: pay the link's own asset with a plain payment`,
+      );
+    }
+    if (!config.sourceAssets.some((allowed) => assetEquals(allowed, sendAsset))) {
+      throw new HttpError(409, `Source asset ${sendAsset.code} is not accepted for path payments`, {
+        reason: "source_asset_not_allowed",
+      });
+    }
+    // The protocol's own limit. Refused here so that it is not Horizon that
+    // says so, after everything else was accepted.
+    if (op.path.length > MAX_PATH_ASSETS) {
+      throw new HttpError(
+        400,
+        `Path payment has ${op.path.length} path assets, at most ${MAX_PATH_ASSETS} are allowed`,
+      );
+    }
+
+    // The transaction has to expire with the quote it was built from. Without
+    // a `maxTime`, or with a distant one, it could be held back and submitted
+    // when the path costs the buyer far more, up to `sendMax`.
+    const maxTime = Number(tx.timeBounds?.maxTime ?? 0);
+    if (!Number.isFinite(maxTime) || maxTime <= 0) {
+      throw new HttpError(400, "Path payment must expire: the transaction has no timeBounds.maxTime");
+    }
+    const now = (config.now ?? Date.now)();
+    const latest = Math.floor((now + config.quoteTtlMs + PATH_EXPIRY_GRACE_MS) / 1000);
+    if (maxTime > latest) {
+      throw new HttpError(
+        400,
+        `Path payment expires too late: timeBounds.maxTime is ${maxTime}, at most ${latest} is allowed`,
+      );
+    }
+
+    // `sendMax` against what the path costs now. The checkout adds the allowed
+    // slippage once; twice that is the most a correct checkout can be off by
+    // while a quote stands, so anything above it was not built from a quote.
+    let quotes: PathQuote[];
+    try {
+      quotes = await quoteStrictReceive({
+        client: config.horizon,
+        source: [sendAsset],
+        destAsset: link.asset,
+        destAmount: normalizeAmount(op.destAmount),
+      });
+    } catch (err) {
+      // Fail closed: with no price to hold `sendMax` to, nothing is relayed.
+      log.warn(
+        {
+          event: "payment.submit.quote_failed",
+          linkId: link.id,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "path payment not relayed: no quote to check it against",
+      );
+      throw new HttpError(503, "horizon_unavailable", { retryable: true });
+    }
+    const quote = quotes.find((candidate) => assetEquals(candidate.sourceAsset, sendAsset));
+    if (!quote) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "no_path",
+        detail: `No path from ${sendAsset.code} to ${link.asset.code} right now`,
+      });
+    }
+    const limit = sendMaxFor(quote.sourceAmount, 2 * config.maxSlippageBps);
+    if (toStroops(op.sendMax) > toStroops(limit)) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "price_moved",
+        detail: `sendMax ${normalizeAmount(op.sendMax)} ${sendAsset.code} is above ${limit}, the most allowed for a path that costs ${quote.sourceAmount} now`,
+      });
     }
   }
 
@@ -1808,6 +1916,24 @@ function offRampRejected(err: OffRampRejectedError): HttpError {
     limits: err.limits,
     availableTypes: err.availableTypes,
   });
+}
+
+/** The most intermediate assets the protocol allows in a path payment. */
+const MAX_PATH_ASSETS = 5;
+
+/**
+ * How much later than its quote a path payment may expire: room for the
+ * wallet prompt and for clocks that disagree a little.
+ */
+const PATH_EXPIRY_GRACE_MS = 30_000;
+
+/**
+ * An SDK asset as an `AssetRef`. `getIssuer()` is typed as possibly-undefined
+ * even on a non-native asset; it becomes null so that `assetEquals` compares
+ * like with like and does not take an issued asset for native.
+ */
+function assetRefOf(asset: Asset): AssetRef {
+  return asset.isNative() ? { code: "XLM", issuer: null } : { code: asset.getCode(), issuer: asset.getIssuer() ?? null };
 }
 
 /**
