@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseQuoteTtlMs, parseSourceAssets } from "./path-payments";
 
 // Minimal dependency-free .env loader. Walks up from this file and the cwd,
 // loading the first .env it finds without overwriting already-set vars.
@@ -360,6 +361,14 @@ export const env = {
   kycEncryptionKeyPrevious: process.env.KYC_ENCRYPTION_KEY_PREVIOUS || undefined,
   // Maximum allowed size (bytes) for multipart KYC file uploads (default 10 MiB).
   kycMaxUploadBytes: num("KYC_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
+  // Which assets a buyer may pay a link with through a path payment (issue
+  // 4.64): a comma-separated allowlist such as "native,EURC:GDHU...". Unset
+  // means native (XLM) alone, so no asset is offered that nobody chose to
+  // allow. A malformed entry stops the boot.
+  pathPaymentsSourceAssets: parseSourceAssets(process.env.PATH_PAYMENTS_SOURCE_ASSETS),
+  // How long a pay-options quote stands, in milliseconds (issue 4.64).
+  // Default 30000; a whole number from 1000 to 300000.
+  pathQuoteTtlMs: parseQuoteTtlMs(process.env.PATH_QUOTE_TTL_MS),
 } as const;
 
 // A production process with the e2e backdoors mounted would accept
