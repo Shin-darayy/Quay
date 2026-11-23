@@ -659,6 +659,25 @@ accepts exactly one payment operation and verifies the destination, asset, amoun
 and required `MEMO_TEXT` against the link. It never marks the link paid directly;
 the ledger watcher remains the source of truth.
 
+While `PATH_PAYMENTS_ENABLED` is on, the one operation may instead be a
+strict-receive path payment (`path_payment_strict_receive`) built from a
+`GET /links/:id/pay-options` quote. What it delivers is held to the rules of a
+plain payment: `destination`, `destAsset`, `destAmount` (not under the
+outstanding amount), the memo, and no operation-level source. Its source side
+has rules of its own:
+
+- `sendAsset` is on `PATH_PAYMENTS_SOURCE_ASSETS`, and is not the link's asset.
+- `path` holds at most 5 assets.
+- The transaction expires: `timeBounds.maxTime` is set, and is no later than now
+  plus `PATH_QUOTE_TTL_MS` plus 30 seconds.
+- `sendMax` is no more than what the path costs when the transaction is
+  submitted plus twice `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`. The API asks Horizon for
+  that price itself.
+
+A strict-send path payment (`path_payment_strict_send`) is never accepted: it
+fixes what the buyer spends and can deliver less than the link asks for. With
+the switch off none of this applies, and only a plain payment is accepted.
+
 **Request**
 ```json
 { "signedXdr": "AAAAAgAAAAA..." }
@@ -670,12 +689,26 @@ the ledger watcher remains the source of truth.
 ```
 
 **400** — malformed XDR, fee-bump envelope, or a transaction containing anything
-other than exactly one payment operation.
+other than exactly one payment operation (or, with path payments on, one
+strict-receive path payment). Also a path payment that sends the link's own
+asset, has no `timeBounds.maxTime`, or expires too late.
 
 **409** — the link is unavailable, or the transaction does not match the link.
 A Horizon rejection returns `{ "error": "payment_rejected", "reason": "...", "detail": "..." }`,
 where `reason` can distinguish `insufficient_balance`, `missing_trustline`, or a
 generic `payment_rejected`.
+
+A path payment is also refused with 409, before anything reaches Horizon, when:
+
+| `error` | `reason` | When |
+|---|---|---|
+| `Source asset <code> is not accepted for path payments` | `source_asset_not_allowed` | `sendAsset` is not on the allowlist |
+| `payment_rejected` | `no_path` | There is no path from `sendAsset` to the link's asset right now |
+| `payment_rejected` | `price_moved` | `sendMax` is above the limit for what the path costs now. `detail` gives both figures. Get a new quote |
+
+**503** — `{ "error": "horizon_unavailable", "retryable": true }`: Horizon could
+not give the price to check a path payment's `sendMax` against. Nothing was
+relayed.
 
 ---
 

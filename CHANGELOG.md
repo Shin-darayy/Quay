@@ -151,6 +151,12 @@ docs:check-env-docs` keeps it in step with the code.
 - Seller anchor sessions are revoked on logout and wallet change, expired
   sessions are swept hourly, and cash-out polling skips sellers whose session
   lapsed.
+- `POST /links/:id/submit` also relays a strict-receive path payment while
+  paying with another asset is switched on. It refuses one whose source asset
+  is not on `PATH_PAYMENTS_SOURCE_ASSETS`, that does not expire with its quote,
+  or whose `sendMax` is above twice the allowed slippage over the current
+  price, and answers `503 horizon_unavailable` when it cannot get that price.
+  With the switch off the endpoint behaves as before.
 
 ### Fixed
 
