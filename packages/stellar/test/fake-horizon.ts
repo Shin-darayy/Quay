@@ -139,11 +139,21 @@ export class FakeHorizonClient implements HorizonClient {
       }),
     } as unknown as HorizonPaymentRecord;
 
-    const list = this.ledger.get(input.account) ?? [];
-    list.push(record);
-    this.ledger.set(input.account, list);
+    return this.addRecord(input.account, record);
+  }
 
-    for (const listener of this.listeners.get(input.account) ?? []) {
+  /**
+   * Files a verbatim Horizon record (e.g. a JSON fixture) under `account` and
+   * notifies live subscribers — the fixture path through the watchers, without
+   * FakePaymentInput having to grow a field for every path payment column.
+   */
+  addRecord(account: string, record: HorizonPaymentRecord): HorizonPaymentRecord {
+    this.notFoundAccounts.delete(account);
+    const list = this.ledger.get(account) ?? [];
+    list.push(record);
+    this.ledger.set(account, list);
+
+    for (const listener of this.listeners.get(account) ?? []) {
       listener.onmessage(record);
     }
     return record;
