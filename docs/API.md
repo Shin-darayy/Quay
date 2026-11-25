@@ -695,7 +695,7 @@ asset, has no `timeBounds.maxTime`, or expires too late.
 
 **409** — the link is unavailable, or the transaction does not match the link.
 A Horizon rejection returns `{ "error": "payment_rejected", "reason": "...", "detail": "..." }`,
-where `reason` can distinguish `insufficient_balance`, `missing_trustline`, or a
+where `reason` can distinguish `insufficient_balance`, `missing_trustline`, `price_moved`, `no_path`, or a
 generic `payment_rejected`.
 
 A path payment is also refused with 409, before anything reaches Horizon, when:
