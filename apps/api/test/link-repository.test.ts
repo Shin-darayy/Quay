@@ -8,7 +8,7 @@ async function freshRepo() {
   const sellers = new DrizzleSellerRepository(db);
   const seller = await sellers.createIfAbsent("GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV");
   const links = new DrizzleLinkRepository(db);
-  return { links, seller };
+  return { links, seller, client, db };
 }
 
 describe("DrizzleLinkRepository claimForCashOut / releaseCashOutClaim", () => {
@@ -110,6 +110,82 @@ describe("DrizzleLinkRepository claimForCashOut / releaseCashOutClaim", () => {
   });
 });
 
+// Issue 4.66: the buyer's side of a path payment is stored on the ledger row
+// and read back verbatim; a plain payment leaves it NULL.
+describe("DrizzleLinkRepository payment source side", () => {
+  const USDC = { code: "USDC", issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" };
+
+  async function linkFor(links: DrizzleLinkRepository, sellerId: string) {
+    return links.create({
+      id: "lnk_source_side",
+      reference: "ref_source_side",
+      sellerId,
+      destination: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      muxedId: null,
+      title: "Path payment",
+      amount: "10",
+      asset: USDC,
+      expiresAt: null,
+    });
+  }
+
+  it("round-trips a path payment's source asset and amount, and NULL for a plain payment", async () => {
+    const { links, seller } = await freshRepo();
+    const link = await linkFor(links, seller.id);
+
+    await links.recordPayment({
+      linkId: link.id,
+      txHash: "tx_path",
+      operationId: "op_path",
+      payer: "GBUYER",
+      amount: "10.0000000",
+      asset: USDC,
+      ledger: 5,
+      sourceAsset: { code: "XLM", issuer: null },
+      sourceAmount: "24.1234567",
+      createdAt: 1000,
+    });
+    await links.recordPayment({
+      linkId: link.id,
+      txHash: "tx_plain",
+      operationId: "op_plain",
+      payer: "GBUYER",
+      amount: "10.0000000",
+      asset: USDC,
+      ledger: 6,
+      createdAt: 2000,
+    });
+
+    const payments = await links.listPaymentsForLink(link.id);
+    expect(payments).toHaveLength(2);
+    expect(payments[0]!).toMatchObject({
+      txHash: "tx_path",
+      sourceAsset: { code: "XLM", issuer: null },
+      sourceAmount: "24.1234567",
+    });
+    expect(payments[1]!).toMatchObject({ txHash: "tx_plain", sourceAsset: null, sourceAmount: null });
+  });
+
+  it("reads a row from before these columns existed as a plain payment", async () => {
+    const { links, seller, client } = await freshRepo();
+    const link = await linkFor(links, seller.id);
+
+    await client.execute({
+      sql: `INSERT INTO link_payments
+        (id, link_id, tx_hash, operation_id, payer, amount, asset_code, asset_issuer, ledger,
+         source_asset_code, source_asset_issuer, source_amount, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+      args: ["pmt_legacy", link.id, "tx_legacy", "op_legacy", "GBUYER", "10", USDC.code, USDC.issuer, 4, 1000],
+    });
+
+    const payments = await links.listPaymentsForLink(link.id);
+    const payment = payments[0]!;
+    expect(payment.amount).toBe("10");
+    expect(payment.sourceAsset).toBeNull();
+    expect(payment.sourceAmount).toBeNull();
+  });
+});
+
 describe("DrizzleLinkRepository listPaymentsForLink (issue 4.58)", () => {
   const USDC = { code: "USDC", issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" };
 
@@ -136,6 +212,8 @@ describe("DrizzleLinkRepository listPaymentsForLink (issue 4.58)", () => {
       asset: USDC,
       ledger: 100,
       createdAt: 2_000,
+      sourceAsset: null,
+      sourceAmount: null,
     };
     const bob = {
       ...alice,

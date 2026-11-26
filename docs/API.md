@@ -477,9 +477,14 @@ If `from` or `to` cannot be parsed, returns **400** `{ "error": "invalid_query",
 **200** `text/csv; charset=utf-8`
 Content-Disposition: `attachment; filename="quay-links-export.csv"`
 ```csv
-id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status
-lnk_y70hu7frwy,pl_8q5g02fczihq,"Order #1042",10.5,USDC,offramp_settled,GAQODF5S...,e2e1a17378c6cd...,10.5,2026-10-25T14:30:56.132Z,2026-10-25T14:31:07.875Z,settled
+id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status,paid_with
+lnk_y70hu7frwy,pl_8q5g02fczihq,"Order #1042",10.5,USDC,offramp_settled,GAQODF5S...,e2e1a17378c6cd...,10.5,2026-10-25T14:30:56.132Z,2026-10-25T14:31:07.875Z,settled,"24.1234567 XLM"
 ```
+
+New columns are appended after `offramp_status`, so a consumer reading the
+earlier columns by position keeps working. `paid_with` is the source side of
+each path payment on the link — `<amount> <asset code>`, several payments joined
+with `; ` — and is empty when every payment was a plain payment.
 
 | Status | `error` | When | What the client should do |
 | --- | --- | --- | --- |
@@ -703,10 +708,18 @@ An `active`, `underpaid`, `expired` or `cancelled` link returns
   "txHash": "b166269ace8a96efe...",
   "payer": "G...",
   "paidAmount": "3",
+  "paidWith": null,
   "createdAt": 1786094880000,
   "updatedAt": 1786094898582
 }
 ```
+
+`paidWith` is the buyer's side of the payment: for each path payment on the
+link, the asset and amount the buyer actually spent to deliver `paidAmount` of
+`asset`. A buyer who spent 24.12 XLM to deliver 10 USDC gets
+`"paidWith": [{ "asset": { "code": "XLM", "issuer": null }, "amount": "24.12" }]`.
+It is `null` when every payment was a plain payment (the buyer spent the asset
+shown in `asset`), including links paid before Quay recorded the buyer's side.
 
 ### Verifying a receipt without trusting this API
 

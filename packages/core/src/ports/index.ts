@@ -809,6 +809,13 @@ export interface LinkPaymentRecord {
   /** Ledger sequence the payment settled in. */
   ledger: number;
   createdAt: number;
+  /**
+   * The source side of a path payment — what the payer actually spent to
+   * deliver `amount` of `asset` (issue 4.66). Absent/null for a plain payment,
+   * and for every row written before these columns existed.
+   */
+  sourceAsset?: AssetRef | null;
+  sourceAmount?: string | null;
 }
 
 export interface LinkRepository {

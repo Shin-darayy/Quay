@@ -307,6 +307,9 @@ export class DrizzleLinkRepository implements LinkRepository {
         assetCode: payment.asset.code,
         assetIssuer: payment.asset.issuer,
         ledger: payment.ledger,
+        sourceAssetCode: payment.sourceAsset?.code ?? null,
+        sourceAssetIssuer: payment.sourceAsset?.issuer ?? null,
+        sourceAmount: payment.sourceAmount ?? null,
         createdAt: payment.createdAt,
       })
       .onConflictDoNothing({ target: [linkPayments.txHash, linkPayments.operationId] });
@@ -330,6 +333,34 @@ export class DrizzleLinkRepository implements LinkRepository {
     return fromStroops(total);
   }
 
+  /**
+   * Every payment recorded against one link, oldest first (issues 4.58, 4.66).
+   * Rows written before `operation_id`/`ledger` existed read back as "" and 0;
+   * rows written before the source columns existed read back as plain payments.
+   */
+  async listPaymentsForLink(linkId: string): Promise<LinkPaymentRecord[]> {
+    const rows = await this.db
+      .select()
+      .from(linkPayments)
+      .where(eq(linkPayments.linkId, linkId))
+      .orderBy(asc(linkPayments.createdAt), asc(linkPayments.txHash), asc(linkPayments.operationId));
+    return rows.map((r) => ({
+      linkId: r.linkId,
+      txHash: r.txHash,
+      // NULL only on rows written before the operation column existed.
+      operationId: r.operationId ?? "",
+      payer: r.payer,
+      amount: r.amount,
+      asset: { code: r.assetCode, issuer: r.assetIssuer ?? null },
+      ledger: r.ledger ?? 0,
+      createdAt: r.createdAt,
+      sourceAsset: r.sourceAssetCode
+        ? { code: r.sourceAssetCode, issuer: r.sourceAssetIssuer ?? null }
+        : null,
+      sourceAmount: r.sourceAmount ?? null,
+    }));
+  }
+
   /** Every payment recorded against any of the seller's links, newest first (privacy export). */
   async listPaymentsBySeller(sellerId: string, limit = 10_001): Promise<SellerPaymentRow[]> {
     const rows = await this.db
@@ -351,27 +382,6 @@ export class DrizzleLinkRepository implements LinkRepository {
     return rows.map((r) => ({ ...r, ledger: r.ledger ?? null }));
   }
 
-  /**
-   * Every payment recorded against one link, oldest first (issue 4.58). Rows
-   * written before `operation_id`/`ledger` existed read back as "" and 0.
-   */
-  async listPaymentsForLink(linkId: string): Promise<LinkPaymentRecord[]> {
-    const rows = await this.db
-      .select()
-      .from(linkPayments)
-      .where(eq(linkPayments.linkId, linkId))
-      .orderBy(asc(linkPayments.createdAt), asc(linkPayments.txHash), asc(linkPayments.operationId));
-    return rows.map((r) => ({
-      linkId: r.linkId,
-      txHash: r.txHash,
-      operationId: r.operationId ?? "",
-      payer: r.payer,
-      amount: r.amount,
-      asset: { code: r.assetCode, issuer: r.assetIssuer ?? null },
-      ledger: r.ledger ?? 0,
-      createdAt: r.createdAt,
-    }));
-  }
 }
 
 function rowToRefund(row: typeof refunds.$inferSelect): Refund {

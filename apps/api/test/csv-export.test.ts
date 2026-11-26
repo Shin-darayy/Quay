@@ -9,6 +9,7 @@ import {
 import type { Container } from "../src/services/container";
 import { SessionIssuer } from "../src/services/session";
 import { LINKS_CSV_HEADER, csvCell, linkRoutes, linkToCsvRow } from "../src/routes/links";
+import type { PaidWithEntry } from "../src/services/paid-with";
 
 /**
  * Regression, BUG-4.13. `GET /links/export/csv` quoted cells but did not
@@ -59,13 +60,13 @@ describe("links CSV export — cash-out state", () => {
       ...over,
     }) as PaymentLink;
 
-  it("adds offramp_status as the LAST column, so earlier columns keep their positions", () => {
+  it("appends paid_with last, so earlier columns keep their positions", () => {
     const cols = LINKS_CSV_HEADER.trim().split(",");
-    expect(cols.slice(0, 11)).toEqual([
+    expect(cols.slice(0, 12)).toEqual([
       "id", "reference", "title", "amount", "asset", "status",
-      "payer", "tx_hash", "paid_amount", "created_at", "updated_at",
+      "payer", "tx_hash", "paid_amount", "created_at", "updated_at", "offramp_status",
     ]);
-    expect(cols.at(-1)).toBe("offramp_status");
+    expect(cols.at(-1)).toBe("paid_with");
   });
 
   it("tells a cash-out awaiting the seller's transfer from one the anchor is processing", () => {
@@ -74,14 +75,27 @@ describe("links CSV export — cash-out state", () => {
     // `status` is identical, which is exactly why the extra column exists
     expect(awaiting[5]).toBe("offramp_pending");
     expect(processing[5]).toBe("offramp_pending");
-    expect(awaiting.at(-1)).toBe("awaiting_transfer");
-    expect(processing.at(-1)).toBe("pending");
+    expect(awaiting[11]).toBe("awaiting_transfer");
+    expect(processing[11]).toBe("pending");
   });
 
-  it("leaves offramp_status empty for a link that was never cashed out", () => {
+  it("leaves offramp_status and paid_with empty for a link that was never cashed out and was paid plainly", () => {
     const row = linkToCsvRow(link({ status: "paid", offrampStatus: null })).split(",");
     expect(row).toHaveLength(LINKS_CSV_HEADER.trim().split(",").length);
-    expect(row.at(-1)).toBe("");
+    expect(row[11]).toBe("");
+    expect(row.at(-1)).toBe(`""`);
+  });
+
+  // Issue 4.66: a merchant reconciling against their wallet sees 10 USDC arrive
+  // and needs the export to say the buyer spent 24.12 XLM for it.
+  it("reports what each path payment was paid with in the last column", () => {
+    const paidWith: PaidWithEntry[] = [
+      { asset: { code: "XLM", issuer: null }, amount: "24.1234567" },
+      { asset: { code: "USDC", issuer: "GISSUER" }, amount: "5.0000000" },
+    ];
+    const row = linkToCsvRow(link({ status: "paid" }), paidWith);
+    expect(row.split(",").at(-1)).toBe(`"24.1234567 XLM; 5.0000000 USDC"`);
+    expect(row.endsWith(csvCell("24.1234567 XLM; 5.0000000 USDC"))).toBe(true);
   });
 });
 
@@ -164,7 +178,7 @@ describe("GET /links/export/csv — date range filtering (BUG-4.46)", () => {
         listLinks: async () => links,
       } as unknown as Container["service"],
       logger: NOOP_LOGGER,
-      links: {} as Container["links"],
+      links: { listPaymentsForLink: async () => [] } as unknown as Container["links"],
       sellers: sellers as unknown as Container["sellers"],
       webhooks: { listDeliveriesByLinkId: async () => [] } as unknown as Container["webhooks"],
       config: { network: "testnet", horizonUrl: "https://horizon-testnet.stellar.org", sellerWallet: owner.wallet },
