@@ -91,6 +91,11 @@ export interface LinkDetail {
   offrampExternalStatus: string | null;
 }
 
+export interface PaidWithItem {
+  asset: { code: string; issuer?: string | null };
+  amount: string;
+}
+
 /** Fields exposed on the public receipt — never includes seller PII. */
 export interface PublicReceipt {
   reference: string;
@@ -101,6 +106,8 @@ export interface PublicReceipt {
   txHash: string | null;
   payer: string | null;
   paidAmount: string | null;
+  /** What the buyer paid with for path payments (issue 5.50 / 4.66). Null for plain payments. */
+  paidWith?: PaidWithItem[] | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -121,6 +128,27 @@ export interface PublicInvoice {
   sellerDisplayName?: string;
   seller?: string;
   clientName: string;
+  lineItems: InvoiceLineItem[];
+  total: string;
+  asset?: string | { code: string; issuer?: string | null };
+  assetCode?: string;
+  issuedAt: number | null;
+  dueAt: number;
+  status: InvoiceStatus;
+  linkId: string | null;
+  notes?: string | null;
+  reference?: string | null;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface Invoice {
+  id: string;
+  sellerId?: string;
+  number: string | null;
+  clientName: string;
+  clientEmail?: string | null;
+  clientAddress?: string | null;
   lineItems: InvoiceLineItem[];
   total: string;
   asset?: string | { code: string; issuer?: string | null };
@@ -623,6 +651,11 @@ export const api = {
   getReceipt: (reference: string) => http<PublicReceipt>(`/r/${reference}`),
 
   getPublicInvoice: (id: string) => http<PublicInvoice>(`/invoices/${id}/public`),
+
+  listInvoices: (status?: InvoiceStatus | "all" | string) =>
+    http<{ invoices: Invoice[] }>(
+      `/invoices${status && status !== "all" ? `?status=${encodeURIComponent(status)}` : ""}`,
+    ),
 
   /** Indicative SEP-38 prices for a paid link — no firm quote is consumed. */
   getOfframpPreview: (id: string, currency?: string) =>

@@ -17,12 +17,18 @@ Error: boom
  FAIL  test/testanchor-full-cashout.test.ts > TestAnchorOffRamp full seller-signed cash-out (live) > stage 6/7 transfer: the seller's key pays the anchor on Horizon testnet with the exact memo
 Error: boom
  FAIL  test/testanchor.test.ts > TestAnchorOffRamp (live) > SEP-6: initiate() then status() completes the request/response round trip
+ FAIL  test/live/path-payment.live.test.ts > Path payment live testnet (live) > stage 5/7 price-moved: POST /links/:id/submit refuses a sendMax far above the quote and says price_moved
 `;
 
 describe("parseFailures", () => {
   it("returns each failing test once, from the FAIL lines", () => {
     const failures = parseFailures(OUTPUT);
-    expect(failures.map((f) => f.file)).toEqual(["test/testanchor.test.ts", "test/anchor.test.ts", "test/testanchor-full-cashout.test.ts"]);
+    expect(failures.map((f) => f.file)).toEqual([
+      "test/testanchor.test.ts",
+      "test/anchor.test.ts",
+      "test/testanchor-full-cashout.test.ts",
+      "test/live/path-payment.live.test.ts",
+    ]);
     expect(failures[0]?.path).toEqual([
       "TestAnchorOffRamp (live)",
       "SEP-6: initiate() then status() completes the request/response round trip",
@@ -42,12 +48,25 @@ describe("parseFailures", () => {
 });
 
 describe("flowOf", () => {
-  const [sep6, sep24, full] = parseFailures(OUTPUT);
+  const [sep6, sep24, full, pathPayment] = parseFailures(OUTPUT);
 
   it("names the SEP-6 suite", () => expect(flowOf(sep6!).id).toBe("sep6"));
   it("names the SEP-24 suite, not SEP-6", () => expect(flowOf(sep24!).id).toBe("sep24"));
   it("names the full cash-out and the stage that failed", () => {
     expect(flowOf(full!)).toEqual({ id: "full-cashout", label: 'Full seller-signed cash-out, stage "transfer"' });
+  });
+  it("names the path payment probe and the stage that failed, not an anchor flow", () => {
+    expect(flowOf(pathPayment!)).toEqual({
+      id: "path-payment",
+      label: 'Path payment live probe (paying a USDC link with XLM), stage "price-moved"',
+    });
+  });
+
+  it("names the refund probe and the stage that failed", () => {
+    const [refund] = parseFailures(
+      " FAIL  test/live/refund.live.test.ts > Refund end-to-end (live) > stage 5/6 submit-refund: the seller-signed refund lands on the ledger and is confirmed\nError: boom\n",
+    );
+    expect(flowOf(refund!)).toEqual({ id: "refund", label: 'Refund end-to-end probe, stage "submit-refund"' });
   });
 });
 

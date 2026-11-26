@@ -80,6 +80,12 @@ export const linkPayments = sqliteTable("link_payments", {
   /** Ledger the payment settled in. Nullable: rows written before the column
    *  existed have no value. */
   ledger: integer("ledger"),
+  /** What the payer actually spent when this was a path payment (issue 4.66).
+   *  All three are NULL for a plain payment and for rows written before they
+   *  existed — those read back as plain payments. */
+  sourceAssetCode: text("source_asset_code"),
+  sourceAssetIssuer: text("source_asset_issuer"), // null = native XLM
+  sourceAmount: text("source_amount"),
   createdAt: integer("created_at").notNull(),
 }, (table) => [
   index("link_payments_link_id_idx").on(table.linkId),

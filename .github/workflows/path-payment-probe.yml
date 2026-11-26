@@ -1,0 +1,164 @@
+name: path-payment-probe
+
+on:
+  schedule:
+    # Nightly at 05:00 UTC — after the anchor probe (04:00) and the refund probe
+    # (04:30), so three live probes are not asking Horizon testnet at once.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# The "pay with any asset" gate (issue 5.51). It lives in its own workflow on
+# purpose: it used to be a step inside anchor-probe.yml, where the repo variable
+# ANCHOR_PROBE_DISABLED=1 — documented for operators who cash out through no
+# anchor — silently turned off the one check that keeps PATH_PAYMENTS_ENABLED
+# off until a real path payment settles. Nothing here depends on an anchor.
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # Seven stages, each waiting on testnet ledgers (Friendbot, the SDEX offer,
+    # two submissions and the watcher), so this is generous on purpose.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Seeds its own SDEX market, pays a 10 USDC link with XLM through the real
+      # GET /links/:id/pay-options and POST /links/:id/submit, and asserts the
+      # public receipt's paidWith. This test is the gate for turning
+      # PATH_PAYMENTS_ENABLED on in production: path payments stay off until it
+      # passes. It asserts the API's answers — a stage that needs an unmerged
+      # dependency (#548, #549, #550) is skipped and named, never re-checked
+      # against Horizon.
+      - name: Path payment end-to-end probe (pay a USDC link with XLM)
+        id: path_payment
+        continue-on-error: true
+        env:
+          RUN_LIVE_PATH_TESTS: "1"
+          # The switch the probe gates. The probe boots the API in-process from
+          # this env, so without it every path payment stage would skip.
+          PATH_PAYMENTS_ENABLED: "1"
+        run: |
+          pnpm --filter @checkout/api exec vitest run test/live/path-payment.live.test.ts --reporter=verbose 2>&1 | tee path-payment-output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          exit ${EXIT_CODE}
+
+      - name: Name the failing suites
+        if: steps.path_payment.outputs.exit_code != '0'
+        run: node scripts/anchor-probe-report.mjs failing-suites.md path-payment-output.txt
+
+      - name: Publish stage summary
+        if: always()
+        run: |
+          {
+            echo "## Path Payment Probe"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Exit code | ${{ steps.path_payment.outputs.exit_code }} |"
+            echo ""
+            echo "Stages: seed-market → participants → boot-api → pay-options → price-moved → path-payment-and-watcher → paid-with."
+            echo "A stage that depends on an unmerged issue is skipped and names it (#548 pay-options, #549 submit relay, #550 paidWith)."
+            echo ""
+            echo "```"
+            grep -E '^ +(✓|×|↓|-) |stage [0-9]/7' path-payment-output.txt || echo "No stage lines found; see the artifact."
+            echo "```"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: path-payment-probe-results
+          path: |
+            path-payment-output.txt
+            failing-suites.md
+          retention-days: 7
+
+      - name: Report success
+        if: steps.path_payment.outputs.exit_code == '0'
+        run: |
+          echo "✅ Path payment probe passed — a USDC link was paid with XLM via the SDEX and the receipt shows it" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update failure issue
+        if: steps.path_payment.outputs.exit_code != '0'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require("fs");
+            let whatBroke = "See the failed run for details.";
+            try { whatBroke = fs.readFileSync("failing-suites.md", "utf8").trim(); } catch {}
+            const label = "path-payment-probe";
+            const issueTitle = "⚠️ Nightly path payment probe failed";
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const body = `The nightly [path payment probe](${runUrl}) against Horizon testnet failed.
+
+            ### What broke
+            ${whatBroke}
+
+            The probe seeds its own SDEX market and pays a 10 USDC link with XLM through the real API: \`GET /links/:id/pay-options\` for the quote, \`POST /links/:id/submit\` for the relay, and the public receipt's \`paidWith\` for the record. It is the gate for enabling \`PATH_PAYMENTS_ENABLED\` in production (issue 5.51): path payments stay off until it passes.
+
+            ### Impact
+            - Paying in any asset is **unverified** until the probe passes again.
+            - \`PATH_PAYMENTS_ENABLED\` must stay off on the deployment this probe covers.
+
+            ### Next steps
+            1. Review the [workflow run logs](${runUrl}) and the \`path-payment-probe-results\` artifact: the first failing stage names where the flow broke.
+            2. If a stage was skipped, it named the issue it waits on (#548, #549, #550); nothing is wrong with the network in that case.
+            3. Check \`https://horizon-testnet.stellar.org\` is reachable and the SDEX offer the probe posts still fills.
+
+            _This issue was auto-filed by the [path-payment-probe workflow](https://github.com/${process.env.GITHUB_REPOSITORY}/actions/workflows/path-payment-probe.yml)._`;
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: "open",
+              per_page: 5,
+            });
+
+            const existing = issues.find(i => i.title === issueTitle);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Probe failed again on ${new Date().toISOString()}. [View run](${runUrl}).`,
+              });
+              core.info(`Added failure comment to existing issue #${existing.number}`);
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body,
+                labels: [label],
+              });
+              core.info("Created new failure issue");
+            }
+
+      # The probe step is continue-on-error so the summary and issue steps above
+      # still run, which also means the job would otherwise finish green. Fail the
+      # run here so the Actions list goes red too.
+      - name: Fail the run if the probe failed
+        if: steps.path_payment.outputs.exit_code != '0'
+        run: |
+          echo "::error::Path payment probe failed (exit ${{ steps.path_payment.outputs.exit_code }}). See the filed issue and the path-payment-probe-results artifact."
+          exit 1

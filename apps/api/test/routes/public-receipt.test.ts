@@ -53,6 +53,48 @@ describe("GET /r/:reference", () => {
     }
   });
 
+  // Issue 4.66: a buyer who spent XLM to deliver USDC needs to see that on the
+  // receipt, because their wallet shows the XLM leaving, not the USDC arriving.
+  it("reports the source side of each path payment as paidWith", async () => {
+    const link = await paidLink();
+    await container.links.recordPayment({
+      linkId: link.id,
+      txHash: "tx_path_receipt",
+      operationId: "op_path_receipt",
+      payer: "GBUYER",
+      amount: "10.0000000",
+      asset: { code: "USDC", issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" },
+      ledger: 7,
+      sourceAsset: { code: "XLM", issuer: null },
+      sourceAmount: "24.1234567",
+      createdAt: Date.now(),
+    });
+
+    const res = await app.request(`/r/${link.reference}`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.paidWith).toEqual([{ asset: { code: "XLM", issuer: null }, amount: "24.1234567" }]);
+  });
+
+  it("returns paidWith null when every payment was a plain payment", async () => {
+    const link = await paidLink();
+    await container.links.recordPayment({
+      linkId: link.id,
+      txHash: "tx_plain_receipt",
+      operationId: "op_plain_receipt",
+      payer: "GBUYER",
+      amount: "10.0000000",
+      asset: { code: "USDC", issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" },
+      ledger: 8,
+      createdAt: Date.now(),
+    });
+
+    const res = await app.request(`/r/${link.reference}`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toHaveProperty("paidWith", null);
+  });
+
   it("404s an unpaid link — an unpaid link is not a receipt", async () => {
     const seller = container.seller;
     const link = await container.links.create({
