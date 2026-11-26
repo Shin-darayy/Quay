@@ -142,7 +142,7 @@ jobs:
       - name: Report success
         if: steps.probe.outputs.exit_code == '0' && steps.full.outputs.exit_code == '0'
         run: |
-          echo "✅ Anchor probe passed — all SEP flows operational against testanchor.stellar.org" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Live probes passed — all SEP flows passed on testnet" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open or update failure issue
         if: steps.probe.outputs.exit_code != '0' || steps.full.outputs.exit_code != '0'
@@ -210,5 +210,5 @@ jobs:
       - name: Fail the run if the probe failed
         if: steps.probe.outputs.exit_code != '0' || steps.full.outputs.exit_code != '0'
         run: |
-          echo "::error::Anchor probe failed (SEP flows exit ${{ steps.probe.outputs.exit_code }}, full cash-out exit ${{ steps.full.outputs.exit_code }}). See the filed issue and the probe-results artifact."
+          echo "::error::Live probe failed (SEP flows exit ${{ steps.probe.outputs.exit_code }}, full cash-out exit ${{ steps.full.outputs.exit_code }}). See the filed issue and the probe-results artifact."
           exit 1

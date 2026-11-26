@@ -307,6 +307,9 @@ export class DrizzleLinkRepository implements LinkRepository {
         assetCode: payment.asset.code,
         assetIssuer: payment.asset.issuer,
         ledger: payment.ledger,
+        sourceAssetCode: payment.sourceAsset?.code ?? null,
+        sourceAssetIssuer: payment.sourceAsset?.issuer ?? null,
+        sourceAmount: payment.sourceAmount ?? null,
         createdAt: payment.createdAt,
       })
       .onConflictDoNothing({ target: [linkPayments.txHash, linkPayments.operationId] });
@@ -330,6 +333,34 @@ export class DrizzleLinkRepository implements LinkRepository {
     return fromStroops(total);
   }
 
+  /**
+   * Every payment recorded against one link, oldest first (issues 4.58, 4.66).
+   * Rows written before `operation_id`/`ledger` existed read back as "" and 0;
+   * rows written before the source columns existed read back as plain payments.
+   */
+  async listPaymentsForLink(linkId: string): Promise<LinkPaymentRecord[]> {
+    const rows = await this.db
+      .select()
+      .from(linkPayments)
+      .where(eq(linkPayments.linkId, linkId))
+      .orderBy(asc(linkPayments.createdAt), asc(linkPayments.txHash), asc(linkPayments.operationId));
+    return rows.map((r) => ({
+      linkId: r.linkId,
+      txHash: r.txHash,
+      // NULL only on rows written before the operation column existed.
+      operationId: r.operationId ?? "",
+      payer: r.payer,
+      amount: r.amount,
+      asset: { code: r.assetCode, issuer: r.assetIssuer ?? null },
+      ledger: r.ledger ?? 0,
+      createdAt: r.createdAt,
+      sourceAsset: r.sourceAssetCode
+        ? { code: r.sourceAssetCode, issuer: r.sourceAssetIssuer ?? null }
+        : null,
+      sourceAmount: r.sourceAmount ?? null,
+    }));
+  }
+
   /** Every payment recorded against any of the seller's links, newest first (privacy export). */
   async listPaymentsBySeller(sellerId: string, limit = 10_001): Promise<SellerPaymentRow[]> {
     const rows = await this.db
@@ -351,27 +382,6 @@ export class DrizzleLinkRepository implements LinkRepository {
     return rows.map((r) => ({ ...r, ledger: r.ledger ?? null }));
   }
 
-  /**
-   * Every payment recorded against one link, oldest first (issue 4.58). Rows
-   * written before `operation_id`/`ledger` existed read back as "" and 0.
-   */
-  async listPaymentsForLink(linkId: string): Promise<LinkPaymentRecord[]> {
-    const rows = await this.db
-      .select()
-      .from(linkPayments)
-      .where(eq(linkPayments.linkId, linkId))
-      .orderBy(asc(linkPayments.createdAt), asc(linkPayments.txHash), asc(linkPayments.operationId));
-    return rows.map((r) => ({
-      linkId: r.linkId,
-      txHash: r.txHash,
-      operationId: r.operationId ?? "",
-      payer: r.payer,
-      amount: r.amount,
-      asset: { code: r.assetCode, issuer: r.assetIssuer ?? null },
-      ledger: r.ledger ?? 0,
-      createdAt: r.createdAt,
-    }));
-  }
 }
 
 function rowToRefund(row: typeof refunds.$inferSelect): Refund {
@@ -394,6 +404,15 @@ function rowToRefund(row: typeof refunds.$inferSelect): Refund {
     updatedAt: row.updatedAt,
   };
 }
+
+// A stored decimal amount as a whole number of stroops, in SQLite integer
+// arithmetic. Amounts are canonical decimal strings with at most seven
+// decimals, and the largest Stellar amount is below 2^63 stroops, so this
+// is exact where a cast to REAL would not be.
+const REFUND_AMOUNT_STROOPS = sql.raw(
+  "(CAST(CASE WHEN instr(amount, '.') = 0 THEN amount ELSE substr(amount, 1, instr(amount, '.') - 1) END AS INTEGER) * 10000000" +
+    " + CAST(substr((CASE WHEN instr(amount, '.') = 0 THEN '' ELSE substr(amount, instr(amount, '.') + 1) END) || '0000000', 1, 7) AS INTEGER))",
+);
 
 /** Refunds in libSQL (issue 4.58). Lists are newest first. */
 export class DrizzleRefundRepository implements RefundRepository {
@@ -419,6 +438,36 @@ export class DrizzleRefundRepository implements RefundRepository {
       createdAt: refund.createdAt,
       updatedAt: refund.updatedAt,
     });
+  }
+
+  /**
+   * One INSERT ... SELECT ... WHERE, like claimForCashOut's single UPDATE:
+   * SQLite runs a statement atomically, so the sum this reads cannot change
+   * before the row is written. "No row inserted" means the payment does not
+   * have that much left.
+   */
+  async claim(refund: Refund, paymentAmount: string): Promise<boolean> {
+    const result = await this.db.run(sql`
+      INSERT INTO refunds (
+        id, link_id, seller_id, payment_tx_hash, payment_operation_id, destination,
+        destination_muxed_id, memo, memo_type, amount, asset_code, asset_issuer,
+        status, tx_hash, failure_reason, created_at, updated_at
+      )
+      SELECT
+        ${refund.id}, ${refund.linkId}, ${refund.sellerId}, ${refund.paymentTxHash},
+        ${refund.paymentOperationId}, ${refund.destination}, ${refund.destinationMuxedId},
+        ${refund.memo}, ${refund.memoType}, ${refund.amount}, ${refund.asset.code},
+        ${refund.asset.issuer}, ${refund.status}, ${refund.txHash}, ${refund.failureReason},
+        ${refund.createdAt}, ${refund.updatedAt}
+      WHERE (
+        SELECT COALESCE(SUM(${REFUND_AMOUNT_STROOPS}), 0)
+        FROM refunds
+        WHERE payment_tx_hash = ${refund.paymentTxHash}
+          AND payment_operation_id = ${refund.paymentOperationId}
+          AND status <> 'failed'
+      ) + ${toStroops(refund.amount)} <= ${toStroops(paymentAmount)}
+    `);
+    return result.rowsAffected === 1;
   }
 
   async findById(id: string): Promise<Refund | null> {

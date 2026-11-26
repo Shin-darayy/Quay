@@ -396,6 +396,90 @@ when no deployment you operate cashes out through an anchor at all. A
 payments-only mainnet (`OFFRAMP=none`) does not need the probe, but it is not a
 reason to disable it while testnet still does.
 
+### Nightly path payment probe
+
+`.github/workflows/path-payment-probe.yml` runs `apps/api/test/live/path-payment.live.test.ts`
+nightly at 05:00 UTC with `RUN_LIVE_PATH_TESTS=1`, in its own workflow: it used to
+be a step inside `anchor-probe.yml`, where `ANCHOR_PROBE_DISABLED=1` — documented
+for operators who cash out through no anchor — quietly turned off the gate too.
+The probe does not depend on an anchor.
+
+It verifies the end-to-end "pay with any asset" loop on live Stellar testnet, and
+every stage asserts the **API's** answer. Nothing falls back to Horizon, so a
+broken flow fails the job instead of being re-checked behind the API's back:
+1. **Self-seeded SDEX liquidity:** It creates a throwaway issuer, mints USDC,
+   funds a market maker via Friendbot, and places a `manageSellOffer` selling USDC
+   for XLM at a fixed price. The test never depends on public testnet liquidity,
+   and testnet resets do not break it.
+2. **Participant setup:** Funds a seller with a USDC trustline and a buyer holding
+   XLM only (no USDC trustline).
+3. **API boot:** Boots the real container in-process against a throwaway SQLite
+   database with `PATH_PAYMENTS_ENABLED=1`, mounts the real `/links` and `/r`
+   routes, and creates a 10 USDC link.
+4. **Pay options:** `GET /links/:id/pay-options` must offer XLM for the 10 USDC at
+   the seeded price; any failure other than the route not existing fails the job.
+5. **Price moved:** `POST /links/:id/submit` must refuse a `sendMax` far above the
+   API's own quote with `409 payment_rejected`, `reason: price_moved`.
+6. **Settlement:** `POST /links/:id/submit` relays the quoted
+   `path_payment_strict_receive`, the watcher matches it, and the link is `paid`
+   with exactly 10 USDC delivered.
+7. **What the buyer paid with:** `GET /r/:reference` must report `paidWith` XLM.
+
+**Dependencies.** Stages 4 and 7 need #548 (`GET /links/:id/pay-options`), stages
+5 and 6 need #549 (relaying a validated path payment), and stage 7 needs #550
+(record what the buyer paid with). Until those are on `dev`, the stage is skipped
+with the issue named in the skip message — it never re-checks Horizon. A probe run
+whose stages all skipped proves nothing, so read the summary before trusting a
+green job.
+
+**Production go-live requirement:** Turning `PATH_PAYMENTS_ENABLED=true` on in
+production (issue 8.30) strictly requires this nightly job to be green. Path
+payments stay disabled on mainnet until this live testnet suite has passed.
+
+**Run it locally:**
+`RUN_LIVE_PATH_TESTS=1 pnpm --filter @checkout/api exec vitest run test/live/path-payment.live.test.ts`
+(the file sets `PATH_PAYMENTS_ENABLED=1` for its own in-process container; the
+workflow sets it too, as the switch the probe gates).
+Without `RUN_LIVE_PATH_TESTS=1`, the test is skipped cleanly and normal test suites
+stay offline with zero network calls.
+
+### Nightly refund probe
+
+`.github/workflows/refund-probe.yml` runs `apps/api/test/live/refund.live.test.ts`
+nightly at 04:30 UTC: it pays a 2 USDC link on testnet, asks the API for a
+0.5 USDC refund, signs the returned XDR with the seller's key, submits it
+through the API, and checks the refund lands on the ledger with memo
+`refund <reference>` — then checks a second refund of 1.6 USDC is refused
+with `409 refund_exceeds_refundable`. This test is the gate for enabling
+`REFUNDS_ENABLED` on mainnet (issue 8.29): refunds stay off until it passes.
+When it fails it files (or comments on) an issue with the `refund-probe` label
+**and** fails the run.
+
+**Secret to configure.** Add the repository Actions secret
+`TEST_REFUND_FUNDER_SECRET`: the secret seed of a **dedicated, testnet-only**
+key, used for nothing else, holding testnet USDC. Each run transfers 2.5 USDC
+from it to the buyer's probe account, so the balance falls by about that much
+per night; keep 30 or more USDC on the account and refill it from Circle's
+testnet faucet (<https://faucet.circle.com>, Stellar testnet) when it runs low.
+Without the secret the prepare stage is skipped, not failed, and the run
+passes vacuously — the job summary says so.
+
+**Reading a failure.** Tests are named `stage N/6 <stage>` and later stages are
+skipped once one fails, so the first red test is where the flow broke:
+`prepare` (account or balance), `boot` (API boot, webhook or link creation),
+`pay` (the buyer payment or the watcher marking the link paid),
+`prepare-refund` (the unsigned refund XDR), `submit-refund` (signing,
+submission or ledger confirmation), `over-refund` (the 1.6 USDC refusal). The
+job summary also lists the last stage completed and both transaction hashes.
+
+**Run it locally** with a funded key:
+`RUN_LIVE_REFUND_TESTS=1 REFUND_PROBE_FUNDER_SECRET=S... pnpm --filter @checkout/api exec vitest run test/live/refund.live.test.ts`.
+It is skipped, never failed, without `RUN_LIVE_REFUND_TESTS`. Until the refund
+endpoints land (issues #535, #537), the refund stages skip on the missing
+route — the pay half still runs live. For a manual run with accounts you
+already funded, pass `REFUND_PROBE_BUYER_SECRET` and
+`REFUND_PROBE_SELLER_SECRET` instead of the funder secret.
+
 ## Deploy
 
 Render deploys `apps/api` as a single Docker web service. The starter plan is

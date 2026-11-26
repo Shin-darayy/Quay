@@ -10,6 +10,7 @@ import {
 } from "@checkout/core";
 import type { Container } from "../services/container";
 import { HttpError } from "../services/link-service";
+import { paidWithFor, paidWithLabel, type PaidWithEntry } from "../services/paid-with";
 import { buildAuthMiddleware, requireScope, type AuthVariables } from "../middleware/auth";
 import { idempotency } from "../middleware/idempotency";
 import { getLogger } from "../request-context";
@@ -107,7 +108,12 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       filtered = filtered.filter((l) => l.createdAt <= toMs);
     }
 
-    const csv = LINKS_CSV_HEADER + filtered.map(linkToCsvRow).join("\n");
+    const rows = await Promise.all(
+      filtered.map(async (l) =>
+        linkToCsvRow(l, paidWithFor(await c.links.listPaymentsForLink(l.id))),
+      ),
+    );
+    const csv = LINKS_CSV_HEADER + rows.join("\n");
 
     return ctx.newResponse(csv, 200, {
       "content-type": "text/csv; charset=utf-8",
@@ -402,6 +408,46 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
     });
   });
 
+  // Refund destination preflight (issue 4.63 / #534). Seller-only, same
+  // ownership rule as cash-out: 404, not 403, when the link is missing or
+  // belongs to someone else (issue #41).
+  //
+  // TODO(8.29): replace `refundsDisabledGate` with `refundsGate(env.refundsEnabled)`
+  // from `apps/api/src/middleware/refunds-gate.ts` once PR #579 lands
+  // (https://github.com/determined-001/Quay/pull/579). That PR owns the flag.
+  // TODO(4.59): `requireScope("refunds:initiate")` uses the scope stubbed in
+  // ALL_SCOPES for issue #535 (https://github.com/determined-001/Quay/issues/535).
+  app.get("/:id/refunds/preflight", refundsDisabledGate(), auth, requireScope("refunds:initiate"), async (ctx) => {
+    const linkId = ctx.req.param("id");
+    const payment = ctx.req.query("payment");
+    const amount = ctx.req.query("amount");
+    if (!payment || !amount) {
+      return ctx.json({ error: "invalid_query", message: "payment and amount are required" }, 400);
+    }
+    try {
+      const existing = await c.service.getLink(linkId);
+      if (!existing) return ctx.json({ error: "not_found" }, 404);
+      if (existing.link.sellerId !== ctx.get("seller").id) {
+        // 404, not 403: telling a stranger "this exists but is not yours" confirms
+        // the id and leaks the link's existence (issue #41).
+        return ctx.json({ error: "not_found" }, 404);
+      }
+      const result = await c.service.refundPreflight(linkId, payment, amount);
+      if (!result.ok) {
+        return ctx.json(
+          { error: "refund_destination_cannot_receive", reason: result.reason, message: result.message },
+          422,
+        );
+      }
+      return ctx.json({ ok: true, destination: result.destination, memoRequired: result.memoRequired });
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return ctx.json({ error: err.message, ...(err.extra ?? {}) }, err.status as 400 | 404);
+      }
+      throw err;
+    }
+  });
+
   // Seller voids a link they created by mistake. Idempotent: cancelling an
   // already-`cancelled` link is a successful no-op. Any state from which
   // `cancelled` is not reachable is rejected with 409 (the on-chain payment
@@ -427,6 +473,21 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
   });
 
   return app;
+}
+
+/**
+ * TODO(8.29): stand-in for `refundsGate` from PR #579
+ * (https://github.com/determined-001/Quay/pull/579). Refunds stay off unless
+ * REFUNDS_ENABLED is exactly "1" or "true" — the same two values that PR reads.
+ * Anything else, including unset, is 501 `refunds_disabled`, and it is mounted
+ * first so a disabled deployment does not ask for credentials.
+ */
+function refundsDisabledGate(): MiddlewareHandler {
+  return async (ctx, next) => {
+    const raw = process.env.REFUNDS_ENABLED;
+    if (raw !== "1" && raw !== "true") return ctx.json({ error: "refunds_disabled" }, 501);
+    await next();
+  };
 }
 
 /**
@@ -457,15 +518,20 @@ export function toCheckoutView(link: PaymentLink) {
 }
 
 /**
- * Header of `GET /links/export/csv`. `offramp_status` is last so existing consumers that read the
- * earlier columns by position keep working. It separates a cash-out that is waiting for the seller's
- * on-chain transfer (`awaiting_transfer`) from one the anchor is paying out (`pending`); `status`
- * alone reads `offramp_pending` for both.
+ * Header of `GET /links/export/csv`. New columns go last, so existing consumers that read the
+ * earlier columns by position keep working.
+ *
+ * `offramp_status` separates a cash-out that is waiting for the seller's on-chain transfer
+ * (`awaiting_transfer`) from one the anchor is paying out (`pending`); `status` alone reads
+ * `offramp_pending` for both.
+ *
+ * `paid_with` is what the buyer spent on each path payment (`24.1234567 XLM`, several joined
+ * with `; `), empty when every payment was a plain payment (issue 4.66).
  */
 export const LINKS_CSV_HEADER =
-  "id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status\n";
+  "id,reference,title,amount,asset,status,payer,tx_hash,paid_amount,created_at,updated_at,offramp_status,paid_with\n";
 
-export function linkToCsvRow(l: PaymentLink): string {
+export function linkToCsvRow(l: PaymentLink, paidWith: PaidWithEntry[] | null = null): string {
   return [
     l.id,
     l.reference,
@@ -479,6 +545,7 @@ export function linkToCsvRow(l: PaymentLink): string {
     new Date(l.createdAt).toISOString(),
     new Date(l.updatedAt).toISOString(),
     l.offrampStatus ?? "",
+    csvCell(paidWithLabel(paidWith)),
   ].join(",");
 }
 

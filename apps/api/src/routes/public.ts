@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Container } from "../services/container";
+import { paidWithFor } from "../services/paid-with";
 
 export function publicRoutes(c: Container): Hono {
   const app = new Hono();
@@ -15,6 +16,8 @@ export function publicRoutes(c: Container): Hono {
       return ctx.json({ error: "not_found" }, 404);
     }
 
+    const payments = await c.links.listPaymentsForLink(link.id);
+
     return ctx.json({
       reference: link.reference,
       title: link.title,
@@ -24,6 +27,9 @@ export function publicRoutes(c: Container): Hono {
       txHash: link.txHash,
       payer: link.payer,
       paidAmount: link.paidAmount,
+      // The source side of each path payment — what the buyer actually spent
+      // (issue 4.66). Null when every payment was a plain payment.
+      paidWith: paidWithFor(payments),
       createdAt: link.createdAt,
       updatedAt: link.updatedAt,
     });
